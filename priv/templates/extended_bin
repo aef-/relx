@@ -257,26 +257,22 @@ ping_or_exit() {
 
 relx_get_nodename() {
     id="longname$(relx_gen_id)-${NAME}"
-    if [ -z "$COOKIE" ]; then
-        # shellcheck disable=SC2086
-        "$BINDIR/erlexec" -boot "$REL_DIR"/start_clean \
-                          -mode interactive \
-                          -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
-                          -eval '[_,H]=re:split(atom_to_list(node()),"@",[unicode,{return,list}]), io:format("~s~n",[H]), halt()' \
-                          -dist_listen false \
-                          ${START_EPMD} \
-                          -noshell "${NAME_TYPE}" "$id"
+
+    relx_erlexec -boot "$REL_DIR"/start_clean \
+        -mode interactive \
+        -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
+        -eval '[_,H]=re:split(atom_to_list(node()),"@",[unicode,{return,list}]), io:format("~s~n",[H]), halt()' \
+        -dist_listen false \
+        ${START_EPMD} \
+        -noshell "${NAME_TYPE}" "$id"
+
+}
+
+relx_erlexec() {
+    if [ -n "$COOKIE" ] ; then
+        "$BINDIR/erlexec" -setcookie "$COOKIE" "$@"
     else
-        # running with setcookie prevents a ~/.erlang.cookie from being created
-        # shellcheck disable=SC2086
-        "$BINDIR/erlexec" -boot "$REL_DIR"/start_clean \
-                          -mode interactive \
-                          -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
-                          -eval '[_,H]=re:split(atom_to_list(node()),"@",[unicode,{return,list}]), io:format("~s~n",[H]), halt()' \
-                          -setcookie "${COOKIE}" \
-                          -dist_listen false \
-                          ${START_EPMD} \
-                          -noshell "${NAME_TYPE}" "$id"
+        "$BINDIR/erlexec" "$@"
     fi
 }
 
@@ -305,12 +301,20 @@ relx_rem_sh() {
     # -dist_listen is new in OTP-23. It keeps the remote node from binding to a listen port
     # and implies the option -hidden
     # shellcheck disable=SC2086
-    exec "$BINDIR/erlexec" ${remote_nodename} -remsh "$NAME" -boot "$REL_DIR"/start_clean -mode interactive \
+    exec relx_erlexec ${remote_nodename} -remsh "$NAME" -boot "$REL_DIR"/start_clean -mode interactive \
          -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
-         -setcookie "$COOKIE" -hidden -kernel net_ticktime "$TICKTIME" \
+         -hidden -kernel net_ticktime "$TICKTIME" \
          -dist_listen false \
          $DIST_ARGS \
          $EXTRA_DIST_ARGS
+}
+
+relx_erl_rpc() {
+    if [ -n "$COOKIE" ] ; then
+        "$ERL_RPC" -c "$COOKIE" "$@"
+    else
+        "$ERL_RPC" "$@"
+    fi
 }
 
 erl_rpc() {
@@ -329,9 +333,9 @@ erl_rpc() {
             fi
 
             if [ "$ADDRESS" ]; then
-                result=$("$ERL_RPC" "${DYNAMIC_NAME}" -c "${COOKIE}" -address "${ADDRESS}" -timeout "${RELX_RPC_TIMEOUT}" -a "${command}")
+                result=$(relx_erl_rpc "${DYNAMIC_NAME}" -address "${ADDRESS}" -timeout "${RELX_RPC_TIMEOUT}" -a "${command}")
             else
-                result=$("$ERL_RPC" "$NAME_TYPE" "$NAME" "${DYNAMIC_NAME}" -c "${COOKIE}" -timeout "${RELX_RPC_TIMEOUT}" -a "${command}")
+                result=$(relx_erl_rpc "$NAME_TYPE" "$NAME" "${DYNAMIC_NAME}" -timeout "${RELX_RPC_TIMEOUT}" -a "${command}")
             fi
             code=$?
             if [ $code -eq 0 ]; then
@@ -352,9 +356,9 @@ erl_eval() {
             command=$*
 
             if [ "$ERL_DIST_PORT" ]; then
-                result=$(echo "${command}" | "$ERL_RPC" "${DYNAMIC_NAME}" -c "${COOKIE}" -address "${ADDRESS}" -timeout "${RELX_RPC_TIMEOUT}" -e)
+                result=$(echo "${command}" | relx_erl_rpc "${DYNAMIC_NAME}" -address "${ADDRESS}" -timeout "${RELX_RPC_TIMEOUT}" -e)
             else
-                result=$(echo "${command}" | "$ERL_RPC" "$NAME_TYPE" "$NAME" "${DYNAMIC_NAME}" -c "${COOKIE}" -timeout "${RELX_RPC_TIMEOUT}" -e)
+                result=$(echo "${command}" | relx_erl_rpc "$NAME_TYPE" "$NAME" "${DYNAMIC_NAME}" -timeout "${RELX_RPC_TIMEOUT}" -e)
             fi
             code=$?
             if [ $code -eq 0 ]; then
@@ -386,16 +390,20 @@ relx_nodetool() {
     # Generate a unique id used to allow multiple nodetool calls to the
     # same node transparently
     nodetool_id="maint$(relx_gen_id)-${NAME}"
+    ERL_FLAGS="${DIST_ARGS} ${EXTRA_DIST_ARGS} ${NAME_TYPE} $nodetool_id -dist_listen false"
+    if [ -n "$COOKIE" ]; then
+        $ERL_FLAGS+=" -setcookie $COOKIE "
+    fi
 
     if [ -z "${START_EPMD}" ]; then
-        ERL_FLAGS="${ERL_FLAGS} ${DIST_ARGS} ${EXTRA_DIST_ARGS} ${NAME_TYPE} $nodetool_id -setcookie ${COOKIE} -dist_listen false" \
+        ERL_FLAGS="$ERL_FLAGS" \
                  "$ERTS_DIR/bin/escript" \
                  "$ROOTDIR/bin/nodetool" \
                  "$NAME_TYPE" "$NAME" \
                  "$command" "$@"
     else
         # shellcheck disable=SC2086
-        ERL_FLAGS="${ERL_FLAGS} ${DIST_ARGS} ${EXTRA_DIST_ARGS} ${NAME_TYPE} $nodetool_id -setcookie ${COOKIE} -dist_listen false" \
+        ERL_FLAGS="$ERL_FLAGS" \
                  "$ERTS_DIR/bin/escript" \
                  "$ROOTDIR/bin/nodetool" \
                  $START_EPMD "$NAME_TYPE" "$NAME" "$command" "$@"
@@ -737,14 +745,7 @@ if [ -n "$RELX_COOKIE" ]; then
     COOKIE="$RELX_COOKIE"
 else
     COOKIE_ARG="$(grep '^-setcookie' "$VMARGS_PATH" || true)"
-    DEFAULT_COOKIE_FILE="$HOME/.erlang.cookie"
-    if [ -z "$COOKIE_ARG" ]; then
-        if [ -f "$DEFAULT_COOKIE_FILE" ]; then
-            COOKIE="$(cat "$DEFAULT_COOKIE_FILE")"
-        else
-            echo "No cookie is set or found. This limits the scripts functionality, installing, upgrading, rpc and getting a list of versions will not work."
-        fi
-    else
+    if [ -n "$COOKIE_ARG" ]; then
         # Extract cookie name from COOKIE_ARG
         COOKIE="$(echo "$COOKIE_ARG" | awk '{print $2}')"
     fi
